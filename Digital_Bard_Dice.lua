@@ -386,14 +386,11 @@ local function centerOr(cx, cy)
 end
 
 -- Float projector for solid fill (no integer rounding here)
-local function rotProjectVertsF(verts, t, scale, cx, cy)
-  t = wrapTau(t)
+local function rotProjectVertsF(verts, scale, cx, cy, ca, sa, cb, sb)
   local S = scale or halfSize()
   local CXC, CYC = centerOr(cx, cy)
-  local ca, sa = cos(t), sin(t)
-  local cb, sb = cos(t * 0.7 + 1.1), sin(t * 0.7 + 1.1)
 
-  local P2, R3 = {}, {}
+  local P2 = {}
   for i = 1, #verts do
     local x, y, z = unpack(verts[i])
     x, y, z = x * S, y * S, z * S
@@ -404,9 +401,8 @@ local function rotProjectVertsF(verts, t, scale, cx, cy)
     local denom = z2 + _ZOFF; if denom < _NEAR then denom = _NEAR end
     local d = _SCALE / denom
     P2[i] = { CXC + xz * d, CYC + y2 * d }
-    R3[i] = { xz, y2, z2 }
   end
-  return P2, R3
+  return P2
 end
 
 -- Rotate + perspective-project; also keep camera-space coords for normals
@@ -472,57 +468,39 @@ local function drawEdges(edges)
   end
 end
 
--- =================== View-dependent Proc Dither ===================
-local DITHER_LEVELS = {
-  0.06, 0.10, 0.14, 0.18, 0.22, 0.26,
-  0.30, 0.34, 0.40, 0.48, 0.58, 0.70
-}
+-- Assign contrasting, stable dither levels to faces sharing an edge.
+local DITHER_LEVELS = { 0.12, 0.88, 0.50, 0.30, 0.70, 0.20, 0.80, 0.40, 0.60 }
 
-local function hash32(x)
-  x = (x ~ (x >> 16)) & 0xFFFFFFFF
-  x = (x * 0x45d9f3b) & 0xFFFFFFFF
-  x = (x ~ (x >> 16)) & 0xFFFFFFFF
-  x = (x * 0x45d9f3b) & 0xFFFFFFFF
-  x = (x ~ (x >> 16)) & 0xFFFFFFFF
-  return x
-end
-
-
--- stable base shade per face index & mesh signature
-local function baseShadeForFace(faceIndex, numFaces, numVerts)
-  local key = (faceIndex * 73856093 + numFaces * 19349663 + numVerts * 83492791) & 0xFFFFFFFF
-  local h = hash32(key)
-  local idx = (h % #DITHER_LEVELS) + 1
-  return DITHER_LEVELS[idx]
-end
-
-local function quantizeShade(x)
-  local best, bd = DITHER_LEVELS[1], 9e9
-  for _, lv in ipairs(DITHER_LEVELS) do
-    local d = math.abs(x - lv)
-    if d < bd then bd, best = d, lv end
+local function sharedEdge(a, b)
+  local shared = 0
+  for i = 1, #a do
+    for j = 1, #b do
+      if a[i] == b[j] then shared = shared + 1; break end
+    end
   end
-  return best
+  return shared >= 2
 end
 
-local function densityScale(_numFaces) return 1.0 end
-
-local function modulateByView(base, nx, ny, nz, numFaces)
-  local len = math.sqrt(nx * nx + ny * ny + nz * nz)
-  if len < 1e-6 then return quantizeShade(base) end
-  local nzN = nz / len
-  local face = math.max(-1, math.min(1, -nzN))
-  local t = (face + 1) * 0.5
-  local add  = 0.22 * t
-  local bias = 0.06
-  local scaled = (base + add + bias) * densityScale(numFaces)
-  if scaled < 0.02 then scaled = 0.02 end
-  if scaled > 0.98 then scaled = 0.98 end
-  return quantizeShade(scaled)
+local function faceShades(F)
+  local shades = {}
+  for fi = 1, #F do
+    local best, bestDistance = DITHER_LEVELS[1], -1
+    for _, candidate in ipairs(DITHER_LEVELS) do
+      local distance = 1
+      for other = 1, fi - 1 do
+        if sharedEdge(F[fi], F[other]) then
+          distance = math.min(distance, math.abs(candidate - shades[other]))
+        end
+      end
+      if distance > bestDistance then best, bestDistance = candidate, distance end
+    end
+    shades[fi] = best
+  end
+  return shades
 end
 
 local function precomputeFaceData(V, F)
-  local FC, FN = {}, {}
+  local FC, FN, shades = {}, {}, faceShades(F)
   for fi = 1, #F do
     local idxs = F[fi]
     local cx, cy, cz = 0, 0, 0
@@ -543,7 +521,7 @@ local function precomputeFaceData(V, F)
     if nlen > 1e-9 then nx, ny, nz = nx/nlen, ny/nlen, nz/nlen else nz = 1 end
     FN[fi] = { nx, ny, nz }
   end
-  return FC, FN
+  return FC, FN, shades
 end
 
 -- Cache per-mesh face centroids and object-space normals (stable)
@@ -551,13 +529,16 @@ local faceCache = setmetatable({}, { __mode = "k" })
 
 -- Optional: warm faceCache so first PROC frame never stalls
 local function warmFaceCaches()
-  local FC, FN
-  FC, FN = precomputeFaceData(V_TETRA, F_TETRA); faceCache[F_TETRA] = { FC = FC, FN = FN }
-  FC, FN = precomputeFaceData(V_CUBE,  F_CUBE ); faceCache[F_CUBE ] = { FC = FC, FN = FN }
-  FC, FN = precomputeFaceData(V_OCTA,  F_OCTA ); faceCache[F_OCTA ] = { FC = FC, FN = FN }
-  FC, FN = precomputeFaceData(V_D10,   F_D10  ); faceCache[F_D10  ] = { FC = FC, FN = FN }
-  FC, FN = precomputeFaceData(V_D12,   F_D12  ); faceCache[F_D12  ] = { FC = FC, FN = FN }
-  FC, FN = precomputeFaceData(V_D20,   F_D20  ); faceCache[F_D20  ] = { FC = FC, FN = FN }
+  local function warm(V, F)
+    local FC, FN, shades = precomputeFaceData(V, F)
+    faceCache[F] = { FC = FC, FN = FN, shades = shades }
+  end
+  warm(V_TETRA, F_TETRA)
+  warm(V_CUBE, F_CUBE)
+  warm(V_OCTA, F_OCTA)
+  warm(V_D10, F_D10)
+  warm(V_D12, F_D12)
+  warm(V_D20, F_D20)
 end
 warmFaceCaches()
 
@@ -566,17 +547,19 @@ local faceVisCache = setmetatable({}, { __mode = "k" })
 
 
 local function drawDieSolid(V, E, F, t, cx, cy, halfSizePx)
-  local P2 = select(1, rotProjectVertsF(V, t, halfSizePx, cx, cy))
+  t = wrapTau(t)
+  local ca, sa = cos(t), sin(t)
+  local cb, sb = cos(t * 0.7 + 1.1), sin(t * 0.7 + 1.1)
+  local P2 = rotProjectVertsF(V, halfSizePx, cx, cy, ca, sa, cb, sb)
 
   local cache = faceCache[F]
-  local FC, FN
-  if cache then FC, FN = cache.FC, cache.FN else
-    FC, FN = precomputeFaceData(V, F)
-    faceCache[F] = { FC = FC, FN = FN }
+  if not cache then
+    local FC, FN, shades = precomputeFaceData(V, F)
+    cache = { FC = FC, FN = FN, shades = shades }
+    faceCache[F] = cache
   end
+  local FC, FN = cache.FC, cache.FN
 
-  local ca, sa = math.cos(wrapTau(t)), math.sin(wrapTau(t))
-  local cb, sb = math.cos(wrapTau(t) * 0.7 + 1.1), math.sin(wrapTau(t) * 0.7 + 1.1)
   local function rotCam(x, y, z)
     local xz = x*ca - y*sa
     local yz = x*sa + y*ca
@@ -633,65 +616,6 @@ local function drawDieSolid(V, E, F, t, cx, cy, halfSizePx)
     return ipts
   end
 
-  local function fillConvexScanline(poly)
-    local n = #poly
-    if n < 3 then return end
-    local rx, ry, rw, rh = gfx.getClipRect()
-    if rx == nil then rx, ry, rw, rh = 0, 0, SCREEN_W, SCREEN_H end
-    local xMin, xMax = rx, rx + rw - 1
-    local yMinBand, yMaxBand = ry, ry + rh - 1
-
-    local edges = {}
-    local ymin, ymax = 1e9, -1e9
-    for i = 1, n do
-      local a = poly[i]
-      local b = poly[(i % n) + 1]
-      local x0, y0 = a[1], a[2]
-      local x1, y1 = b[1], b[2]
-      if y0 ~= y1 then
-        if y0 > y1 then x0, x1, y0, y1 = x1, x0, y1, y0 end
-        local yStart = math.floor(y0 + 0.5)
-        local yEnd   = math.floor(y1 + 0.5) - 1
-        if yEnd >= yMinBand and yStart <= yMaxBand then
-          if yStart < yMinBand then yStart = yMinBand end
-          if yEnd > yMaxBand then yEnd = yMaxBand end
-          if yStart <= yEnd then
-            local invm = (x1 - x0) / (y1 - y0)
-            local xAtStart = x0 + (yStart - y0) * invm
-            edges[#edges + 1] = { yStart = yStart, yEnd = yEnd, x = xAtStart, invm = invm }
-            if yStart < ymin then ymin = yStart end
-            if yEnd > ymax then ymax = yEnd end
-          end
-        end
-      end
-    end
-    if #edges < 2 or ymin > ymax then return end
-
-    for y = ymin, ymax do
-      local xs, k = {}, 0
-      for i = 1, #edges do
-        local e = edges[i]
-        if y >= e.yStart and y <= e.yEnd then
-          k = k + 1
-          xs[k] = e.x
-          e.x = e.x + e.invm
-        end
-      end
-      if k >= 2 then
-        if k == 2 and xs[1] > xs[2] then xs[1], xs[2] = xs[2], xs[1] else table.sort(xs) end
-        for i = 1, k - 1, 2 do
-          local xa = math.floor(xs[i] + 0.5)
-          local xb = math.floor(xs[i + 1] + 0.5)
-          if xb >= xMin and xa <= xMax then
-            if xa < xMin then xa = xMin end
-            if xb > xMax then xb = xMax end
-            if xb >= xa then gfx.drawLine(xa, y, xb, y) end
-          end
-        end
-      end
-    end
-  end
-
   for _, o in ipairs(order) do
     local fi   = o.fi
     local idxs = F[fi]
@@ -705,8 +629,7 @@ local function drawDieSolid(V, E, F, t, cx, cy, halfSizePx)
     visRec.front[fi] = isFront
 
     if isFront then
-      local base  = baseShadeForFace(fi, numFaces, #V)
-      local shade = modulateByView(base, nx, ny, nz, numFaces)
+      local shade = cache.shades[fi]
 
       local pts = {}
       do
@@ -763,8 +686,14 @@ local function drawDieSolid(V, E, F, t, cx, cy, halfSizePx)
 
         local ipts = roundAndPruneInt(pts)
         if #ipts >= 3 then
-          gfx.setDitherPattern(shade)
-          fillConvexScanline(ipts)
+          gfx.setColor(gfx.kColorBlack)
+          gfx.setDitherPattern(shade, gfx.image.kDitherTypeBayer8x8)
+          local coords = {}
+          for i = 1, #ipts do
+            coords[#coords + 1] = ipts[i][1]
+            coords[#coords + 1] = ipts[i][2]
+          end
+          gfx.fillPolygon(unpack(coords))
         end
       end
     end
@@ -773,9 +702,13 @@ local function drawDieSolid(V, E, F, t, cx, cy, halfSizePx)
   gfx.setDitherPattern(1.0)
   gfx.setImageDrawMode(gfx.kDrawModeCopy)
 
-  local ecx, ecy = centerOr(cx, cy)
-  local ehs = halfSizePx or halfSize()
-  drawEdges(projectMeshEdgesAt(V, E, t, ecx, ecy, ehs))
+  gfx.setColor(gfx.kColorBlack)
+  for i = 1, #E do
+    local edge = E[i]
+    local a, b = P2[edge[1]], P2[edge[2]]
+    gfx.drawLine(floor(a[1] + 0.5), floor(a[2] + 0.5),
+                 floor(b[1] + 0.5), floor(b[2] + 0.5))
+  end
 end
 
 -- === Wireframe (used in-game) ===
