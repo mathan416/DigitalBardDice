@@ -87,4 +87,4 @@ Current package metadata:
 - Author: `Mathan Games`
 - Bundle ID: `com.mathan.digitalbarddice`
 - Version: `1.1`
-- Build number: `5`
+- Build number: `6`
