@@ -1,5 +1,4 @@
 import "CoreLibs/graphics"
-import "CoreLibs/timer"
 
 local pd  = playdate
 local gfx = pd.graphics
@@ -20,7 +19,7 @@ local rollmode = RM_NORMAL
 local TITLE_SCALE = 0.34 
 
 local TAU = math.pi * 2
--- ============ Angle wrapping & D6 debug ============
+-- ============ Angle wrapping ============
 local function wrapTau(a)
   -- Keep angles bounded to avoid FP drift
   -- Range: [0, TAU)
@@ -38,10 +37,6 @@ local TURNS_MIN, TURNS_MAX = 2, 3
 -- Title animation (slow roll + morph between standard dice)
 local TITLE_ROT_SPEED   = 0.35
 local TITLE_SWITCH_SECS = 1.8
--- Title view: 0 = wireframe, 1 = per-face procedural dither
-local TITLE_VIEW_WIREFRAME, TITLE_VIEW_PROC = 0, 1
-local titleView = TITLE_VIEW_WIREFRAME
-
 
 local title_time_acc = 0
 local title_ang      = 0
@@ -57,7 +52,9 @@ local unpack          = table.unpack
 
 local sides      = 20
 local last_detail = nil
+local last_detail_mode = RM_NORMAL  -- roll mode that produced last_detail
 local last_result = nil
+local redrawResult                  -- forward declaration (defined after the renderers)
 
 local spin_t0, spin_t1 = 0, 0
 local ang0, ang1       = 0, 0
@@ -90,22 +87,24 @@ local function saveState()
   playdate.datastore.write({
     sides       = sides,
     rollmode    = rollmode,
-    state       = state,        -- S_TITLE / S_IDLE / etc.
     last_result = last_result,
     shading     = shadingEnabled
   }, SAVEFILE)
 end
 
+-- The game always starts on the title screen; only settings are restored.
 local function loadState()
   local d = playdate.datastore.read(SAVEFILE)
-  if d then
-    sides       = math.max(MIN_SIDES, math.min(MAX_SIDES, d.sides or sides))
-    rollmode    = tonumber(d.rollmode) or RM_NORMAL
-    last_result = d.last_result
-    shadingEnabled = (d.shading == nil) and shadingEnabled or (d.shading and true or false)
-    -- optional: restore last state sensibly
-    if d.state == S_RESULT then state = S_IDLE else state = S_TITLE end
-  end
+  if type(d) ~= "table" then return end
+
+  local n = tonumber(d.sides)
+  if n then sides = math.max(MIN_SIDES, math.min(MAX_SIDES, math.floor(n))) end
+
+  local rm = tonumber(d.rollmode)
+  if rm == RM_NORMAL or rm == RM_ADV or rm == RM_DIS then rollmode = rm else rollmode = RM_NORMAL end
+
+  last_result = tonumber(d.last_result)
+  if type(d.shading) == "boolean" then shadingEnabled = d.shading end
 end
 
 -- =================== Geometry helpers ===================
@@ -128,7 +127,7 @@ end
 -- connect pairs at the shortest edge length
 local function buildEdgesFromVerts(verts)
   local dmin = nil
-  local pairs = {}
+  local candidates = {}
   for i = 1, #verts - 1 do
     local ax, ay, az = unpack(verts[i])
     for j = i + 1, #verts do
@@ -136,12 +135,12 @@ local function buildEdgesFromVerts(verts)
       local dx, dy, dz = ax - bx, ay - by, az - bz
       local d2 = dx * dx + dy * dy + dz * dz
       if dmin == nil or d2 < dmin then dmin = d2 end
-      pairs[#pairs + 1] = { i, j, d2 }
+      candidates[#candidates + 1] = { i, j, d2 }
     end
   end
   local eps = dmin * 1.00001
   local edges = {}
-  for _, p in ipairs(pairs) do
+  for _, p in ipairs(candidates) do
     if p[3] <= eps then edges[#edges + 1] = { p[1], p[2] } end
   end
   return edges
@@ -355,7 +354,7 @@ local F_D12 = facesFromVerts(V_D12)
 
 local function meshForSides(n)
   local best, bd = 4, math.huge
-  for _, v in ipairs({ 4, 6, 8, 10, 12, 20 }) do
+  for _, v in ipairs(COMMON_DICE) do
     local d = math.abs(v - n); if d < bd then bd, best = d, v end
   end
   if     best == 4  then return V_TETRA, E_TETRA, F_TETRA
@@ -385,87 +384,35 @@ local function centerOr(cx, cy)
   return clipCenter()
 end
 
--- Float projector for solid fill (no integer rounding here)
-local function rotProjectVertsF(verts, scale, cx, cy, ca, sa, cb, sb)
-  local S = scale or halfSize()
-  local CXC, CYC = centerOr(cx, cy)
-
-  local P2 = {}
-  for i = 1, #verts do
-    local x, y, z = unpack(verts[i])
-    x, y, z = x * S, y * S, z * S
-    local xz = x * ca - y * sa
-    local yz = x * sa + y * ca
-    local y2 = yz * cb - z * sb
-    local z2 = yz * sb + z * cb
-    local denom = z2 + _ZOFF; if denom < _NEAR then denom = _NEAR end
-    local d = _SCALE / denom
-    P2[i] = { CXC + xz * d, CYC + y2 * d }
-  end
-  return P2
+-- Rotation for angle t: spin about Z by t, then tilt about X by 0.7t + 1.1
+local function rotationFor(t)
+  t = wrapTau(t)
+  local tb = t * 0.7 + 1.1
+  return cos(t), sin(t), cos(tb), sin(tb)
 end
 
--- Rotate + perspective-project; also keep camera-space coords for normals
-local function rotProjectVerts(verts, t, scale, cx, cy)
-  t = wrapTau(t)
-  local S = scale or halfSize()
-  local CXC, CYC = centerOr(cx, cy)
-  local ca, sa = cos(t), sin(t)
-  local cb, sb = cos(t * 0.7 + 1.1), sin(t * 0.7 + 1.1)
-
-  local P2, R3 = {}, {}
-  for i = 1, #verts do
-    local x, y, z = unpack(verts[i])
-    x, y, z = x * S, y * S, z * S
-    local xz = x * ca - y * sa
-    local yz = x * sa + y * ca
-    local y2 = yz * cb - z * sb
-    local z2 = yz * sb + z * cb
-    local denom = z2 + _ZOFF; if denom < _NEAR then denom = _NEAR end
-    local d = _SCALE / denom
-    P2[i] = { floor(CXC + xz * d + 0.5), floor(CYC + y2 * d + 0.5) }
-    R3[i] = { xz, y2, z2 }
-  end
-  return P2, R3
+-- Rotate a point into camera space (+z points away from the viewer)
+local function rotCam(x, y, z, ca, sa, cb, sb)
+  local yz = x * sa + y * ca
+  return x * ca - y * sa, yz * cb - z * sb, yz * sb + z * cb
 end
 
-local function projectMeshEdgesAt(verts, edges, t, cx, cy, halfSizePx)
-  t = wrapTau(t)
-  local S = halfSizePx or halfSize()
-  local cx0, cy0 = centerOr(cx, cy)
-  local ca, sa = cos(t), sin(t)
-  local cb, sb = cos(t * 0.7 + 1.1), sin(t * 0.7 + 1.1)
-
+-- Rotate + perspective-project verts to screen space (unrounded)
+local function projectVerts(verts, S, cx, cy, ca, sa, cb, sb)
   local P = {}
   for i = 1, #verts do
-    local x, y, z = unpack(verts[i])
-    x, y, z = x * S, y * S, z * S
-    local xz = x * ca - y * sa
-    local yz = x * sa + y * ca
-    local y2 = yz * cb - z * sb
-    local z2 = yz * sb + z * cb
-    local denom = z2 + _ZOFF; if denom < _NEAR then denom = _NEAR end
+    local v = verts[i]
+    local x, y, z = rotCam(v[1] * S, v[2] * S, v[3] * S, ca, sa, cb, sb)
+    local denom = z + _ZOFF; if denom < _NEAR then denom = _NEAR end
     local d = _SCALE / denom
-    P[i] = { floor(cx0 + xz * d + 0.5), floor(cy0 + y2 * d + 0.5) }
+    P[i] = { cx + x * d, cy + y * d }
   end
-
-  local out = {}
-  for i = 1, #edges do
-    local a, b = edges[i][1], edges[i][2]
-    local p0, p1 = P[a], P[b]
-    out[i] = { p0[1], p0[2], p1[1], p1[2] }
-  end
-  return out
+  return P
 end
 
-
--- === Edges ===
-local function drawEdges(edges)
-  gfx.setColor(gfx.kColorBlack)
-  for i = 1, #edges do
-    local e = edges[i]
-    gfx.drawLine(e[1], e[2], e[3], e[4])
-  end
+local function drawProjectedEdge(P, ia, ib)
+  local a, b = P[ia], P[ib]
+  gfx.drawLine(floor(a[1] + 0.5), floor(a[2] + 0.5), floor(b[1] + 0.5), floor(b[2] + 0.5))
 end
 
 -- Assign contrasting, stable dither levels to faces sharing an edge.
@@ -499,16 +446,11 @@ local function faceShades(F)
   return shades
 end
 
-local function precomputeFaceData(V, F)
-  local FC, FN, shades = {}, {}, faceShades(F)
+-- Object-space unit normal per face (Newell's method)
+local function faceNormals(V, F)
+  local FN = {}
   for fi = 1, #F do
     local idxs = F[fi]
-    local cx, cy, cz = 0, 0, 0
-    for _, i in ipairs(idxs) do
-      local v = V[i]; cx, cy, cz = cx + v[1], cy + v[2], cz + v[3] end
-    local inv = 1 / #idxs; cx, cy, cz = cx*inv, cy*inv, cz*inv
-    FC[fi] = { cx, cy, cz }
-
     local nx, ny, nz = 0, 0, 0
     for i = 1, #idxs do
       local a = V[idxs[i]]
@@ -521,218 +463,126 @@ local function precomputeFaceData(V, F)
     if nlen > 1e-9 then nx, ny, nz = nx/nlen, ny/nlen, nz/nlen else nz = 1 end
     FN[fi] = { nx, ny, nz }
   end
-  return FC, FN, shades
+  return FN
 end
 
--- Cache per-mesh face centroids and object-space normals (stable)
-local faceCache = setmetatable({}, { __mode = "k" })
+-- Per-mesh face normals and shades, keyed by face list; built once at load
+local faceCache = {}
+for _, mesh in ipairs({
+  { V_TETRA, F_TETRA }, { V_CUBE, F_CUBE }, { V_OCTA, F_OCTA },
+  { V_D10, F_D10 }, { V_D12, F_D12 }, { V_D20, F_D20 },
+}) do
+  local V, F = mesh[1], mesh[2]
+  faceCache[F] = { FN = faceNormals(V, F), shades = faceShades(F) }
+end
 
--- Optional: warm faceCache so first PROC frame never stalls
-local function warmFaceCaches()
-  local function warm(V, F)
-    local FC, FN, shades = precomputeFaceData(V, F)
-    faceCache[F] = { FC = FC, FN = FN, shades = shades }
+-- Remembers front/back state per face to add hysteresis near nz ≈ 0
+local faceVisCache = {}
+local ENTER_T, EXIT_T = -0.002, 0.002
+
+-- Round to whole pixels, then drop repeated and collinear points
+local function area2(a, b, c) return (b[1]-a[1])*(c[2]-a[2]) - (b[2]-a[2])*(c[1]-a[1]) end
+
+local function roundAndPruneInt(pts)
+  local ipts = {}
+  for i = 1, #pts do
+    local a = pts[i]
+    local b = pts[(i % #pts) + 1]
+    local ax, ay = floor(a[1] + 0.5), floor(a[2] + 0.5)
+    if not (ax == floor(b[1] + 0.5) and ay == floor(b[2] + 0.5)) then ipts[#ipts + 1] = { ax, ay } end
   end
-  warm(V_TETRA, F_TETRA)
-  warm(V_CUBE, F_CUBE)
-  warm(V_OCTA, F_OCTA)
-  warm(V_D10, F_D10)
-  warm(V_D12, F_D12)
-  warm(V_D20, F_D20)
+  local changed = true
+  while changed and #ipts >= 3 do
+    changed = false
+    for i = 1, #ipts do
+      local A = ipts[(i - 2) % #ipts + 1]
+      local B = ipts[i]
+      local C = ipts[i % #ipts + 1]
+      if area2(A, B, C) == 0 then table.remove(ipts, i); changed = true; break end
+    end
+  end
+  return ipts
 end
-warmFaceCaches()
 
--- remembers front/back state per face to add hysteresis near nz ≈ 0
-local faceVisCache = setmetatable({}, { __mode = "k" })
-
-
+-- === Shaded: dithered front faces + visible edges ===
 local function drawDieSolid(V, E, F, t, cx, cy, halfSizePx)
-  t = wrapTau(t)
-  local ca, sa = cos(t), sin(t)
-  local cb, sb = cos(t * 0.7 + 1.1), sin(t * 0.7 + 1.1)
-  local P2 = rotProjectVertsF(V, halfSizePx, cx, cy, ca, sa, cb, sb)
+  local ca, sa, cb, sb = rotationFor(t)
+  local cx0, cy0 = centerOr(cx, cy)
+  local P = projectVerts(V, halfSizePx or halfSize(), cx0, cy0, ca, sa, cb, sb)
 
   local cache = faceCache[F]
-  if not cache then
-    local FC, FN, shades = precomputeFaceData(V, F)
-    cache = { FC = FC, FN = FN, shades = shades }
-    faceCache[F] = cache
-  end
-  local FC, FN = cache.FC, cache.FN
+  local FN, shades = cache.FN, cache.shades
+  local front = faceVisCache[F]
+  if not front then front = {}; faceVisCache[F] = front end
 
-  local function rotCam(x, y, z)
-    local xz = x*ca - y*sa
-    local yz = x*sa + y*ca
-    local y2 = yz*cb - z*sb
-    local z2 = yz*sb + z*cb
-    return xz, y2, z2
-  end
-
-  local order = {}
-  local NUMF = #F
-  for fi = 1, NUMF do
-    local cxo, cyo, czo = table.unpack(FC[fi])
-    local _, _, zc = rotCam(cxo, cyo, czo)
-    local zbias = 1e-4 * (fi / NUMF)
-    order[#order + 1] = { fi = fi, z = zc + zbias }
-  end
-  table.sort(order, function(a, b) if a.z == b.z then return a.fi < b.fi else return a.z < b.z end end)
+  local EDGE_KEY = #V + 1   -- packs a vertex pair (a < b) into one table key
+  local visibleEdges = {}
 
   gfx.setImageDrawMode(gfx.kDrawModeCopy)
   gfx.setColor(gfx.kColorBlack)
 
-  local numFaces = #F
-
-  local visRec = faceVisCache[F]
-  local ENTER_T, EXIT_T = -0.002, 0.002
-
-    if not visRec then
-    visRec = { front = {} }
-    faceVisCache[F] = visRec
-   end
-
-  local function roundAndPruneInt(pts)
-    local ipts = {}
-    for i = 1, #pts do ipts[i] = { math.floor(pts[i][1] + 0.5), math.floor(pts[i][2] + 0.5) } end
-    local tmp = {}
-    for i = 1, #ipts do
-      local a = ipts[i]
-      local b = ipts[(i % #ipts) + 1]
-      if not (a[1] == b[1] and a[2] == b[2]) then tmp[#tmp + 1] = a end
-    end
-    ipts = tmp
-    if #ipts < 3 then return ipts end
-    local function area2(a, b, c) return (b[1]-a[1])*(c[2]-a[2]) - (b[2]-a[2])*(c[1]-a[1]) end
-    local changed = true
-    while changed and #ipts >= 3 do
-      changed = false
-      for i = 1, #ipts do
-        local A = ipts[(i - 2) % #ipts + 1]
-        local B = ipts[i]
-        local C = ipts[(i) % #ipts + 1]
-        if area2(A, B, C) == 0 then table.remove(ipts, i); changed = true; break end
-      end
-    end
-    return ipts
-  end
-
-  for _, o in ipairs(order) do
-    local fi   = o.fi
-    local idxs = F[fi]
-
-    local nxo, nyo, nzo = table.unpack(FN[fi])
-    local nx, ny, nz = rotCam(nxo, nyo, nzo)
-
-    local wasFront = visRec.front[fi]
+  -- The dice are convex, so front faces never overlap and need no depth sort
+  for fi = 1, #F do
+    local n = FN[fi]
+    local _, _, nz = rotCam(n[1], n[2], n[3], ca, sa, cb, sb)
     local isFront
-    if wasFront then isFront = (nz < EXIT_T) else isFront = (nz < ENTER_T) end
-    visRec.front[fi] = isFront
+    if front[fi] then isFront = (nz < EXIT_T) else isFront = (nz < ENTER_T) end
+    front[fi] = isFront
 
     if isFront then
-      local shade = cache.shades[fi]
-
+      local idxs = F[fi]
       local pts = {}
-      do
-        local EPS_UV = 1e-6
-        for i = 1, #idxs do
-          local p = P2[idxs[i]]
-          local px, py = p[1], p[2]
-          local dup = false
-          for j = 1, #pts do
-            local qx, qy = pts[j][1], pts[j][2]
-            if math.abs(px - qx) < EPS_UV and math.abs(py - qy) < EPS_UV then dup = true; break end
-          end
-          if not dup then pts[#pts + 1] = { px, py } end
-        end
+      for i = 1, #idxs do
+        local a, b = idxs[i], idxs[(i % #idxs) + 1]
+        pts[i] = P[a]
+        if a > b then a, b = b, a end
+        visibleEdges[a * EDGE_KEY + b] = true
       end
 
-      if #pts >= 3 then
-        local cx2, cy2 = 0, 0
-        for i = 1, #pts do cx2, cy2 = cx2 + pts[i][1], cy2 + pts[i][2] end
-        cx2, cy2 = cx2 / #pts, cy2 / #pts
-        table.sort(pts, function(a, b)
-          return math.atan(a[2] - cy2, a[1] - cx2) < math.atan(b[2] - cy2, b[1] - cx2)
-        end)
-
-        local minEdge = 1e9
-        for i = 1, #pts do
-          local a = pts[i]
-          local b = pts[(i % #pts) + 1]
-          local dx, dy = b[1] - a[1], b[2] - a[2]
-          local L = math.sqrt(dx*dx + dy*dy)
-          if L < minEdge then minEdge = L end
+      -- Face vertices are already in winding order, so no re-sort is needed
+      local ipts = roundAndPruneInt(pts)
+      if #ipts >= 3 then
+        local coords = {}
+        for i = 1, #ipts do
+          coords[2 * i - 1] = ipts[i][1]
+          coords[2 * i]     = ipts[i][2]
         end
-        local E0, K = 2.0, 0.20
-        local raw = (minEdge > E0) and ((minEdge - E0) * K) or 0.0
-        local INSET_BASE
-        if     numFaces >= 20 then INSET_BASE = 0.16
-        elseif numFaces >= 12 then INSET_BASE = 0.20
-        elseif numFaces <=  8 then INSET_BASE = 0.28 else INSET_BASE = 0.25 end
-        local INSET_PX = math.min(INSET_BASE, raw)
-        if INSET_PX > 0 then
-          local icx, icy = 0, 0
-          for i = 1, #pts do icx, icy = icx + pts[i][1], icy + pts[i][2] end
-          icx, icy = icx / #pts, icy / #pts
-          for i = 1, #pts do
-            local x, y = pts[i][1], pts[i][2]
-            local dx, dy = icx - x, icy - y
-            local L = math.sqrt(dx*dx + dy*dy)
-            if L > 0 then
-              pts[i][1] = x + (dx / L) * INSET_PX
-              pts[i][2] = y + (dy / L) * INSET_PX
-            end
-          end
-        end
-
-        local ipts = roundAndPruneInt(pts)
-        if #ipts >= 3 then
-          gfx.setColor(gfx.kColorBlack)
-          gfx.setDitherPattern(shade, gfx.image.kDitherTypeBayer8x8)
-          local coords = {}
-          for i = 1, #ipts do
-            coords[#coords + 1] = ipts[i][1]
-            coords[#coords + 1] = ipts[i][2]
-          end
-          gfx.fillPolygon(unpack(coords))
-        end
+        gfx.setDitherPattern(shades[fi], gfx.image.kDitherTypeBayer8x8)
+        gfx.fillPolygon(unpack(coords))
       end
     end
   end
 
   gfx.setDitherPattern(1.0)
-  gfx.setImageDrawMode(gfx.kDrawModeCopy)
 
+  -- Outline only edges that border a visible face; hidden back edges stay hidden
   gfx.setColor(gfx.kColorBlack)
   for i = 1, #E do
-    local edge = E[i]
-    local a, b = P2[edge[1]], P2[edge[2]]
-    gfx.drawLine(floor(a[1] + 0.5), floor(a[2] + 0.5),
-                 floor(b[1] + 0.5), floor(b[2] + 0.5))
+    local ia, ib = E[i][1], E[i][2]
+    local lo, hi = ia, ib
+    if lo > hi then lo, hi = hi, lo end
+    if visibleEdges[lo * EDGE_KEY + hi] then drawProjectedEdge(P, ia, ib) end
   end
 end
 
--- === Wireframe (used in-game) ===
+-- === Wireframe: every edge ===
 local function drawDieWireframe(V, E, t, cx, cy, halfSizePx)
-  local edges = projectMeshEdgesAt(V, E, t, cx, cy, halfSizePx)
-  drawEdges(edges)
+  local cx0, cy0 = centerOr(cx, cy)
+  local P = projectVerts(V, halfSizePx or halfSize(), cx0, cy0, rotationFor(t))
+  gfx.setColor(gfx.kColorBlack)
+  for i = 1, #E do drawProjectedEdge(P, E[i][1], E[i][2]) end
 end
 
--- Renders based on the user's "Shading" checkbox:
+-- Renders based on the user's "Shading" setting
 local function drawDieCurrent(V, E, F, t, cx, cy, halfSizePx)
   if shadingEnabled then
-    -- Solid with procedural dither (this function already overlays edges)
     drawDieSolid(V, E, F, t, cx, cy, halfSizePx)
   else
-    -- Classic wireframe
     drawDieWireframe(V, E, t, cx, cy, halfSizePx)
   end
 end
 
 -- ============= Pretty UI helpers =============
-local function drawRoundRect(x, y, w, h, r)
-  if gfx.drawRoundRect then gfx.drawRoundRect(x, y, w, h, r) else gfx.drawRect(x, y, w, h) end
-end
-
 local function drawTextCenteredInRect(text, x, y, w, h)
   local tw, th = gfx.getTextSize(text)
   gfx.drawText(text, math.floor(x + (w - tw) / 2), math.floor(y + (h - th) / 2))
@@ -740,8 +590,7 @@ end
 
 local function drawPill(x, y, w, h, text)
   gfx.setColor(gfx.kColorBlack)
-  drawRoundRect(x, y, w, h, 6)
-  gfx.fillRoundRect(x + 1, y + 1, w - 2, h - 2, 6)
+  gfx.fillRoundRect(x, y, w, h, 6)
   gfx.setImageDrawMode(gfx.kDrawModeFillWhite)
   drawTextCenteredInRect(text, x, y, w, h)
   gfx.setImageDrawMode(gfx.kDrawModeCopy)
@@ -750,8 +599,8 @@ end
 local function drawStageFrame()
   local rx = 8
   gfx.setColor(gfx.kColorBlack)
-  drawRoundRect(CLIP_X - 2, CLIP_Y - 2, CLIP_W + 4, CLIP_H + 4, rx)
-  drawRoundRect(CLIP_X, CLIP_Y, CLIP_W, CLIP_H, rx - 2)
+  gfx.drawRoundRect(CLIP_X - 2, CLIP_Y - 2, CLIP_W + 4, CLIP_H + 4, rx)
+  gfx.drawRoundRect(CLIP_X, CLIP_Y, CLIP_W, CLIP_H, rx - 2)
   for yy = CLIP_Y + 8, CLIP_Y + CLIP_H - 8, 16 do
     for xx = CLIP_X + 8, CLIP_X + CLIP_W - 8, 16 do
       gfx.drawPixel(xx, yy)
@@ -765,9 +614,6 @@ local function drawTextCentered(text, y)
 end
 
 -- =================== 7-segment digits ===================
-local function segH(x, y, w, t) gfx.fillRect(x, y, w, t) end
-local function segV(x, y, h, t) gfx.fillRect(x, y, t, h) end
-
 local DIGIT_SEGS = {
   [0] = { A = 1, B = 1, C = 1, D = 1, E = 1, F = 1 },
   [1] = { B = 1, C = 1 },
@@ -781,25 +627,24 @@ local DIGIT_SEGS = {
   [9] = { A = 1, B = 1, C = 1, D = 1, F = 1, G = 1 },
 }
 
-local function drawDigitMed(x, y, ch)
-  local d = tonumber(ch); if not d then return end
-  local W, H, T, M = 12, 20, 2, 1
+-- Draw one digit W x H px with segment thickness T and margin M
+local function drawDigit(x, y, ch, W, H, T, M)
+  local s = DIGIT_SEGS[tonumber(ch)]; if not s then return end
   local mid = y + math.floor(H / 2 - T / 2)
   local xL, xR = x, x + W - T
-  local yT, yB = y, y + H - T
   local yU0, yU1 = y + M, mid - 2
   local yL0, yL1 = mid + 2, y + H - M - 1
-  local s = DIGIT_SEGS[d] or {}
-  local function segH2(x0, y0, w) gfx.fillRect(x0, y0, w, T) end
-  local function segV2(x0, y0, h) gfx.fillRect(x0, y0, T, h) end
-  if s.A then segH2(x + M, yT, W - 2 * M) end
-  if s.G then segH2(x + M, mid, W - 2 * M) end
-  if s.D then segH2(x + M, yB, W - 2 * M) end
-  if s.F then segV2(xL, yU0, yU1 - yU0 + 1) end
-  if s.B then segV2(xR, yU0, yU1 - yU0 + 1) end
-  if s.E then segV2(xL, yL0, yL1 - yL0 + 1) end
-  if s.C then segV2(xR, yL0, yL1 - yL0 + 1) end
+  if s.A then gfx.fillRect(x + M, y,         W - 2 * M, T) end
+  if s.G then gfx.fillRect(x + M, mid,       W - 2 * M, T) end
+  if s.D then gfx.fillRect(x + M, y + H - T, W - 2 * M, T) end
+  if s.F then gfx.fillRect(xL, yU0, T, yU1 - yU0 + 1) end
+  if s.B then gfx.fillRect(xR, yU0, T, yU1 - yU0 + 1) end
+  if s.E then gfx.fillRect(xL, yL0, T, yL1 - yL0 + 1) end
+  if s.C then gfx.fillRect(xR, yL0, T, yL1 - yL0 + 1) end
 end
+
+local function drawDigitMed(x, y, ch) drawDigit(x, y, ch, 12, 20, 2, 1) end
+local function drawDigitBig(x, y, ch) drawDigit(x, y, ch, 24, 40, 3, 2) end
 
 local function drawMedStrCentered(s, bx, by, bw, bh)
   local per = 13
@@ -807,25 +652,6 @@ local function drawMedStrCentered(s, bx, by, bw, bh)
   local x0 = bx + math.max(0, math.floor((bw - w) / 2))
   local y0 = by + math.max(0, math.floor((bh - 20) / 2))
   for i = 1, #s do drawDigitMed(x0 + (i - 1) * per, y0, s:sub(i, i)) end
-end
-
-local function drawDigitBig(x, y, ch)
-  if ch == "-" then segH(x + 2, y + 24, 20, 3); return end
-  local d = tonumber(ch); if not d then return end
-  local W, H, T, M = 24, 40, 3, 2
-  local mid = y + math.floor(H / 2 - T / 2)
-  local xL, xR = x, x + W - T
-  local yT, yB = y, y + H - T
-  local yU0, yU1 = y + M, mid - 2
-  local yL0, yL1 = mid + 2, y + H - M - 1
-  local s = DIGIT_SEGS[d] or {}
-  if s.A then segH(x + M, yT, W - 2 * M, T) end
-  if s.G then segH(x + M, mid, W - 2 * M, T) end
-  if s.D then segH(x + M, yB, W - 2 * M, T) end
-  if s.F then segV(xL, yU0, yU1 - yU0 + 1, T) end
-  if s.B then segV(xR, yU0, yU1 - yU0 + 1, T) end
-  if s.E then segV(xL, yL0, yL1 - yL0 + 1, T) end
-  if s.C then segV(xR, yL0, yL1 - yL0 + 1, T) end
 end
 
 local function drawNumberBig(n)
@@ -907,48 +733,8 @@ local function drawHUD(text)
 end
 
 -- === Title screen ===
-
--- Deterministic 32-bit checksum (no bitwise ops)
-local function vertsChecksum(V)
-  local h = 5381.0
-  for i = 1, #V do
-    local x, y, z = V[i][1], V[i][2], V[i][3]
-    for _, v in ipairs{ x, y, z } do
-      local s = string.format("%.9f", v)
-      for k = 1, #s do
-        h = (h * 33.0 + string.byte(s, k)) % 4294967296.0
-      end
-    end
-  end
-  return math.floor(h)
-end
-
--- One baseline for the cube
-local CUBE_CSUM0 = vertsChecksum(V_CUBE)
-
--- If you use the version that always checks the cube:
-local function drawD6DebugLabels(t, cx, cy, halfSizePx)
-  local P = select(1, rotProjectVerts(V_CUBE, t, halfSizePx, cx, cy))
-  gfx.setImageDrawMode(gfx.kDrawModeCopy)
-  gfx.setColor(gfx.kColorBlack)
-  for i = 1, #P do
-    local px, py = P[i][1], P[i][2]
-    gfx.fillCircleAtPoint(px, py, 2)
-    local label = tostring(i)
-    local tw, th = gfx.getTextSize(label)
-    gfx.drawText(label, px - math.floor(tw / 2), py - th - 2)
-  end
-  local live = vertsChecksum(V_CUBE)
-  local sx, sy = stageRect()
-  local tag = (live == CUBE_CSUM0) and "OK" or "MISMATCH"
-  gfx.drawText(string.format("D6 Σ: 0x%08X  %s", live, tag), sx + 4, sy + 4)
-end
-
-
 local function drawTitle()
   gfx.clearClipRect()
-  gfx.setImageDrawMode(gfx.kDrawModeCopy)
-  gfx.setColor(gfx.kColorBlack)
   gfx.clear(gfx.kColorWhite)
   gfx.setImageDrawMode(gfx.kDrawModeCopy)
   gfx.setColor(gfx.kColorBlack)
@@ -965,7 +751,7 @@ local function drawTitle()
   drawDieCurrent(V, E, F, title_ang, cx, cy, halfSizePx)
 end
 
--- =================== In-game rendering (WIREFRAME ONLY) ===================
+-- =================== In-game rendering ===================
 local function redrawIdle()
   currentScale = SCALE_IDLE
   gfx.clear(gfx.kColorWhite)
@@ -978,26 +764,11 @@ local function redrawIdle()
   gfx.setColor(gfx.kColorBlack)
   drawDieCurrent(V, E, F, idleAngle)
 
-  -- D6 vertex labels + checksum overlay
-  if sides == 6 then
-    local cx, cy = clipCenter()
-    local hs = halfSize()
-    -- drawD6DebugLabels(idleAngle, cx, cy, hs)
-  end
-
   gfx.clearClipRect()
   drawHUD("")
 end
 
-
 -- =================== Easing ===================
-local function easeOutCubic(u)
-  if u <= 0 then return 0 end
-  if u >= 1 then return 1 end
-  local t = 1 - u
-  return 1 - t * t * t
-end
-
 local function easeRollNatural(u)
   if u <= 0 then return 0 end
   if u >= 1 then return 1 end
@@ -1005,6 +776,35 @@ local function easeRollNatural(u)
 end
 
 
+
+-- =================== Result screen ===================
+local function resultHudText()
+  return "Result: " .. tostring(last_result) .. "  A: Reroll"
+end
+
+redrawResult = function()
+  gfx.clear(gfx.kColorWhite)
+  drawStageFrame()
+
+  local sx, sy, sw, sh = stageRect()
+  gfx.setClipRect(sx, sy, sw, sh)
+
+  gfx.setColor(gfx.kColorBlack)
+  if last_result then drawNumberBig(last_result) end
+  if last_detail then
+    drawAdvDisBoxes(last_detail.a, last_detail.b, last_detail.chosen, last_detail_mode)
+  end
+
+  gfx.clearClipRect()
+  drawHUD(resultHudText())
+end
+
+-- Switch to the idle preview without a large first-frame time step
+local function enterIdle()
+  state = S_IDLE
+  last_ts = pd.getCurrentTimeMilliseconds() / 1000
+  redrawIdle()
+end
 
 -- =================== Rolling ===================
 local function startSpin()
@@ -1032,41 +832,32 @@ local function finishSpin()
   end
 
   last_result = chosen
-  saveState()
+  last_detail_mode = rollmode
+  -- Carry the final spin pose into idle so the die doesn't jump
+  idleAngle = wrapTau(ang1)
 
-  gfx.clear(gfx.kColorWhite)
-  drawStageFrame()
-
-  local sx, sy, sw, sh = stageRect()
-  gfx.setClipRect(sx, sy, sw, sh)
-
-  gfx.setColor(gfx.kColorBlack)
-  drawNumberBig(chosen)
-  if last_detail then drawAdvDisBoxes(last_detail.a, last_detail.b, last_detail.chosen, rollmode) end
-
-  gfx.clearClipRect()
-  drawHUD("Result: " .. tostring(chosen) .. "   A: OK")
+  redrawResult()
 end
 
 -- =================== Helpers ===================
+-- Position of each common die in COMMON_DICE, e.g. COMMON_INDEX[8] == 3
+local COMMON_INDEX = {}
+for i, v in ipairs(COMMON_DICE) do COMMON_INDEX[v] = i end
+
+-- Up: on a common die, step to the next one (wrapping); otherwise snap up to the nearest
 local function quickNext()
-  if sides == COMMON_DICE[1] or sides == COMMON_DICE[2] or sides == COMMON_DICE[3]
-     or sides == COMMON_DICE[4] or sides == COMMON_DICE[5] or sides == COMMON_DICE[6] then
-    for i, v in ipairs(COMMON_DICE) do if v == sides then sides = COMMON_DICE[(i % #COMMON_DICE) + 1]; return end end
-  else
-    for i, v in ipairs(COMMON_DICE) do if v >= sides then sides = v; return end end
-    sides = COMMON_DICE[#COMMON_DICE]
-  end
+  local i = COMMON_INDEX[sides]
+  if i then sides = COMMON_DICE[(i % #COMMON_DICE) + 1]; return end
+  for _, v in ipairs(COMMON_DICE) do if v >= sides then sides = v; return end end
+  sides = COMMON_DICE[#COMMON_DICE]
 end
 
+-- Down: on a common die, step to the previous one (wrapping); otherwise snap down to the nearest
 local function quickPrev()
-  if sides == COMMON_DICE[1] or sides == COMMON_DICE[2] or sides == COMMON_DICE[3]
-     or sides == COMMON_DICE[4] or sides == COMMON_DICE[5] or sides == COMMON_DICE[6] then
-    for i, v in ipairs(COMMON_DICE) do if v == sides then sides = COMMON_DICE[((i - 2) % #COMMON_DICE) + 1]; return end end
-  else
-    for i = #COMMON_DICE, 1, -1 do local v = COMMON_DICE[i]; if v <= sides then sides = v; return end end
-    sides = COMMON_DICE[1]
-  end
+  local i = COMMON_INDEX[sides]
+  if i then sides = COMMON_DICE[((i - 2) % #COMMON_DICE) + 1]; return end
+  for j = #COMMON_DICE, 1, -1 do if COMMON_DICE[j] <= sides then sides = COMMON_DICE[j]; return end end
+  sides = COMMON_DICE[1]
 end
 
 local function setupSystemMenu()
@@ -1115,11 +906,12 @@ function playdate.update()
 
   elseif state == S_IDLE then
     -- input
-    if pd.buttonJustPressed(pd.kButtonLeft)  then sides = math.max(MIN_SIDES, sides - 1); saveState() end
-    if pd.buttonJustPressed(pd.kButtonRight) then sides = math.min(MAX_SIDES, sides + 1); saveState() end
-    if pd.buttonJustPressed(pd.kButtonUp)    then quickNext();  saveState() end
-    if pd.buttonJustPressed(pd.kButtonDown)  then quickPrev();  saveState() end
-    if pd.buttonJustPressed(pd.kButtonB)     then rollmode = (rollmode + 1) % 3;             end
+    -- Settings are persisted by the pause/lock/sleep/terminate hooks
+    if pd.buttonJustPressed(pd.kButtonLeft)  then sides = math.max(MIN_SIDES, sides - 1) end
+    if pd.buttonJustPressed(pd.kButtonRight) then sides = math.min(MAX_SIDES, sides + 1) end
+    if pd.buttonJustPressed(pd.kButtonUp)    then quickNext() end
+    if pd.buttonJustPressed(pd.kButtonDown)  then quickPrev() end
+    if pd.buttonJustPressed(pd.kButtonB)     then rollmode = (rollmode + 1) % 3 end
     if pd.buttonJustPressed(pd.kButtonA)     then startSpin(); return end
 
     -- animate + draw every frame
@@ -1149,13 +941,6 @@ function playdate.update()
     gfx.setColor(gfx.kColorBlack)
     drawDieCurrent(V, E, F, ang)
 
-    -- D6 labels during spin too
-    if sides == 6 then
-      local cx, cy = clipCenter()
-      local hs = halfSize()
-      --drawD6DebugLabels(ang, cx, cy, hs)
-    end
-
     gfx.clearClipRect()
     drawHUD("Rolling…")
 
@@ -1166,35 +951,37 @@ function playdate.update()
     if pd.buttonJustPressed(pd.kButtonA) then startSpin(); return end
     if pd.buttonJustPressed(pd.kButtonB) then
       rollmode = (rollmode + 1) % 3
-      saveState()
-      drawHUD("Result: " .. tostring(last_result) .. "   A: OK")
+      drawHUD(resultHudText())
     end
-    if pd.buttonJustPressed(pd.kButtonLeft)  then sides = math.max(MIN_SIDES, sides - 1); state = S_IDLE; redrawIdle(); return end
-    if pd.buttonJustPressed(pd.kButtonRight) then sides = math.min(MAX_SIDES, sides + 1); state = S_IDLE; redrawIdle(); return end
-    if pd.buttonJustPressed(pd.kButtonUp)    then quickNext();  state = S_IDLE; redrawIdle(); return end
-    if pd.buttonJustPressed(pd.kButtonDown)  then quickPrev();  state = S_IDLE; redrawIdle(); return end
+    if pd.buttonJustPressed(pd.kButtonLeft)  then sides = math.max(MIN_SIDES, sides - 1); enterIdle(); return end
+    if pd.buttonJustPressed(pd.kButtonRight) then sides = math.min(MAX_SIDES, sides + 1); enterIdle(); return end
+    if pd.buttonJustPressed(pd.kButtonUp)    then quickNext();  enterIdle(); return end
+    if pd.buttonJustPressed(pd.kButtonDown)  then quickPrev();  enterIdle(); return end
     return
   end
 end
 
 
 function playdate.gameWillPause()
-  -- If you add timers later, pause them:
-  if playdate.timer and playdate.timer.pauseTimers then playdate.timer.pauseTimers() end
-  -- If you add audio later, mute/stop here.
   saveState()
 end
 
-function playdate.gameWillResume()
-  if playdate.timer and playdate.timer.resumeTimers then playdate.timer.resumeTimers() end
-  -- Ensure a fresh frame is drawn after resume:
+-- Redraw the current screen after the game was paused, locked or asleep.
+-- Resets the frame clock so animations don't jump by the time spent away.
+local function redrawCurrent()
+  last_ts = playdate.getCurrentTimeMilliseconds() / 1000
   if state == S_IDLE then
     redrawIdle()
   elseif state == S_TITLE then
-    -- force a redraw of title
-    last_ts = playdate.getCurrentTimeMilliseconds() / 1000
     drawTitle()
+  elseif state == S_RESULT then
+    redrawResult()
   end
+  -- S_SPIN redraws every frame on its own
+end
+
+function playdate.gameWillResume()
+  redrawCurrent()
 end
 
 function playdate.gameWillTerminate()
@@ -1205,9 +992,12 @@ function playdate.deviceWillLock()
   saveState()
 end
 
+function playdate.deviceWillSleep()
+  saveState()
+end
+
 function playdate.deviceDidUnlock()
-  -- Optional: redraw; same idea as resume
-  if state == S_IDLE then redrawIdle() else drawTitle() end
+  redrawCurrent()
 end
 
 -- =================== Init ===================
@@ -1220,5 +1010,5 @@ end
 
 loadState()
 setupSystemMenu()
-pd.display.setRefreshRate(50)
+pd.display.setRefreshRate(30)
 state = S_TITLE
