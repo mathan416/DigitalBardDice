@@ -72,7 +72,7 @@ local SCALE_SPIN = 0.48
 
 -- Set true to draw the frame rate in the top-left corner (for on-device testing)
 local SHOW_FPS = false
-local TARGET_FPS = 30
+local TARGET_FPS = 50
 
 -- Idle animation speed (radians per second)
 local IDLE_ROT_SPEED = 0.6
