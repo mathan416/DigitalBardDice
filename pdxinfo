@@ -3,5 +3,5 @@ author=Mathan Games
 description=An animated dice roller with wireframe and shaded dice.
 bundleID=com.mathan.digitalbarddice
 version=1.1
-buildNumber=6
+buildNumber=7
 imagePath=launcher
