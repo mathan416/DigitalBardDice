@@ -20,13 +20,11 @@ local TITLE_SCALE = 0.34
 
 local TAU = math.pi * 2
 -- ============ Angle wrapping ============
-local function wrapTau(a)
-  -- Keep angles bounded to avoid FP drift
-  -- Range: [0, TAU)
-  a = a % TAU
-  if a < 0 then a = a + TAU end
-  return a
-end
+-- Angles are kept bounded to avoid float drift. The die's tilt turns at 0.7x
+-- the spin rate, so the angle wraps every 10 turns: both rotations are then
+-- whole turns and the pose stays continuous (wrapping every turn made it snap).
+local ANGLE_PERIOD = TAU * 10
+local function wrapAngle(a) return a % ANGLE_PERIOD end
 
 -- was IDLE_ANGLE; now mutable so title → game matches
 local idleAngle = TAU * 0.125
@@ -59,7 +57,7 @@ local redrawResult                  -- forward declaration (defined after the re
 local spin_t0, spin_t1 = 0, 0
 local ang0, ang1       = 0, 0
 
-local shadingEnabled = false   -- default OFF (current behavior is wireframe)
+local shadingEnabled = true    -- shaded by default; B on the title screen or the menu toggles it
 local menuInited = false
 local shadingMenuItem = nil
 
@@ -71,7 +69,10 @@ end
 
 local SCALE_IDLE = 0.46
 local SCALE_SPIN = 0.48
-local currentScale = SCALE_IDLE
+
+-- Set true to draw the frame rate in the top-left corner (for on-device testing)
+local SHOW_FPS = false
+local TARGET_FPS = 30
 
 -- Idle animation speed (radians per second)
 local IDLE_ROT_SPEED = 0.6
@@ -352,68 +353,17 @@ local V_D12, E_D12 = makeDodeca()
 V_D12 = normalizeVerts(V_D12)
 local F_D12 = facesFromVerts(V_D12)
 
-local function meshForSides(n)
-  local best, bd = 4, math.huge
-  for _, v in ipairs(COMMON_DICE) do
-    local d = math.abs(v - n); if d < bd then bd, best = d, v end
-  end
-  if     best == 4  then return V_TETRA, E_TETRA, F_TETRA
-  elseif best == 6  then return V_CUBE,  E_CUBE,  F_CUBE
-  elseif best == 8  then return V_OCTA,  E_OCTA,  F_OCTA
-  elseif best == 10 then return V_D10,   E_D10,   F_D10
-  elseif best == 12 then return V_D12,   E_D12,   F_D12
-  else                    return V_D20,   E_D20,   F_D20
-  end
-end
-
 -- =================== Projection ===================
-local _ZOFF, _NEAR, _SCALE = 260.0, 30.0, 180.0
+local ZOFF, NEAR, PROJ_SCALE = 260.0, 30.0, 180.0
+local TILT_RATE, TILT_PHASE = 0.7, 1.1   -- tilt about X turns at 0.7x the spin rate
 
-local function clipCenter()
-  local x, y, w, h = stageRect()
-  return x + math.floor(w / 2), y + math.floor(h / 2)
-end
-
-local function halfSize()
-  local _, _, w, h = stageRect()
-  return math.max(8, math.floor(math.min(w, h) * currentScale))
-end
-
-local function centerOr(cx, cy)
-  if cx ~= nil and cy ~= nil then return cx, cy end
-  return clipCenter()
-end
-
--- Rotation for angle t: spin about Z by t, then tilt about X by 0.7t + 1.1
-local function rotationFor(t)
-  t = wrapTau(t)
-  local tb = t * 0.7 + 1.1
-  return cos(t), sin(t), cos(tb), sin(tb)
-end
-
--- Rotate a point into camera space (+z points away from the viewer)
-local function rotCam(x, y, z, ca, sa, cb, sb)
-  local yz = x * sa + y * ca
-  return x * ca - y * sa, yz * cb - z * sb, yz * sb + z * cb
-end
-
--- Rotate + perspective-project verts to screen space (unrounded)
-local function projectVerts(verts, S, cx, cy, ca, sa, cb, sb)
-  local P = {}
-  for i = 1, #verts do
-    local v = verts[i]
-    local x, y, z = rotCam(v[1] * S, v[2] * S, v[3] * S, ca, sa, cb, sb)
-    local denom = z + _ZOFF; if denom < _NEAR then denom = _NEAR end
-    local d = _SCALE / denom
-    P[i] = { cx + x * d, cy + y * d }
-  end
-  return P
-end
-
-local function drawProjectedEdge(P, ia, ib)
-  local a, b = P[ia], P[ib]
-  gfx.drawLine(floor(a[1] + 0.5), floor(a[2] + 0.5), floor(b[1] + 0.5), floor(b[2] + 0.5))
-end
+-- Stage geometry is fixed, so compute it once
+local STAGE_X, STAGE_Y, STAGE_W, STAGE_H = stageRect()
+local STAGE_CX = STAGE_X + floor(STAGE_W / 2)
+local STAGE_CY = STAGE_Y + floor(STAGE_H / 2)
+local function halfSizeFor(scale) return math.max(8, floor(math.min(STAGE_W, STAGE_H) * scale)) end
+local HALF_IDLE = halfSizeFor(SCALE_IDLE)
+local HALF_SPIN = halfSizeFor(SCALE_SPIN)
 
 -- Assign contrasting, stable dither levels to faces sharing an edge.
 local DITHER_LEVELS = { 0.12, 0.88, 0.50, 0.30, 0.70, 0.20, 0.80, 0.40, 0.60 }
@@ -446,140 +396,205 @@ local function faceShades(F)
   return shades
 end
 
--- Object-space unit normal per face (Newell's method)
-local function faceNormals(V, F)
-  local FN = {}
+-- Build a render-ready mesh: flat number arrays (no per-frame tables), face
+-- normals and shades, edge-to-face adjacency, and reusable projection buffers.
+local function makeMesh(V, E, F)
+  local m = {
+    nv = #V, ne = #E, nf = #F, faces = F, shades = faceShades(F),
+    vx = {}, vy = {}, vz = {},     -- object-space vertices
+    ea = {}, eb = {},              -- edge endpoints
+    ef1 = {}, ef2 = {},            -- the two faces each edge borders
+    fnx = {}, fny = {}, fnz = {},  -- object-space face normals
+    px = {}, py = {},              -- projected whole-pixel vertices (rewritten each frame)
+    front = { [0] = true },        -- per-face visibility with hysteresis; [0] = always
+  }
+  for i = 1, #V do m.vx[i], m.vy[i], m.vz[i] = V[i][1], V[i][2], V[i][3] end
+
+  local K = #V + 1   -- packs a sorted vertex pair into one table key
+  local edgeIndex = {}
+  for i = 1, #E do
+    local a, b = E[i][1], E[i][2]
+    m.ea[i], m.eb[i], m.ef1[i], m.ef2[i] = a, b, 0, 0
+    if a > b then a, b = b, a end
+    edgeIndex[a * K + b] = i
+  end
+
   for fi = 1, #F do
     local idxs = F[fi]
-    local nx, ny, nz = 0, 0, 0
+    local nx, ny, nz = 0, 0, 0   -- Newell's method
     for i = 1, #idxs do
-      local a = V[idxs[i]]
-      local b = V[idxs[(i % #idxs) + 1]]
+      local ia, ib = idxs[i], idxs[(i % #idxs) + 1]
+      local a, b = V[ia], V[ib]
       nx = nx + (a[2] - b[2]) * (a[3] + b[3])
       ny = ny + (a[3] - b[3]) * (a[1] + b[1])
       nz = nz + (a[1] - b[1]) * (a[2] + b[2])
+      if ia > ib then ia, ib = ib, ia end
+      local e = edgeIndex[ia * K + ib]
+      if e then
+        if m.ef1[e] == 0 then m.ef1[e] = fi else m.ef2[e] = fi end
+      end
     end
-    local nlen = math.sqrt(nx*nx + ny*ny + nz*nz)
-    if nlen > 1e-9 then nx, ny, nz = nx/nlen, ny/nlen, nz/nlen else nz = 1 end
-    FN[fi] = { nx, ny, nz }
+    local nlen = math.sqrt(nx * nx + ny * ny + nz * nz)
+    if nlen > 1e-9 then nx, ny, nz = nx / nlen, ny / nlen, nz / nlen else nx, ny, nz = 0, 0, 1 end
+    m.fnx[fi], m.fny[fi], m.fnz[fi] = nx, ny, nz
+    m.front[fi] = false
   end
-  return FN
+  return m
 end
 
--- Per-mesh face normals and shades, keyed by face list; built once at load
-local faceCache = {}
-for _, mesh in ipairs({
-  { V_TETRA, F_TETRA }, { V_CUBE, F_CUBE }, { V_OCTA, F_OCTA },
-  { V_D10, F_D10 }, { V_D12, F_D12 }, { V_D20, F_D20 },
-}) do
-  local V, F = mesh[1], mesh[2]
-  faceCache[F] = { FN = faceNormals(V, F), shades = faceShades(F) }
+local MESH_TETRA = makeMesh(V_TETRA, E_TETRA, F_TETRA)
+local MESH_CUBE  = makeMesh(V_CUBE,  E_CUBE,  F_CUBE)
+local MESH_OCTA  = makeMesh(V_OCTA,  E_OCTA,  F_OCTA)
+local MESH_D10   = makeMesh(V_D10,   E_D10,   F_D10)
+local MESH_D12   = makeMesh(V_D12,   E_D12,   F_D12)
+local MESH_D20   = makeMesh(V_D20,   E_D20,   F_D20)
+local MESH_BY_COMMON = {
+  [4] = MESH_TETRA, [6] = MESH_CUBE, [8] = MESH_OCTA,
+  [10] = MESH_D10, [12] = MESH_D12, [20] = MESH_D20,
+}
+
+-- Mesh for any side count: the nearest standard die (ties go to the smaller)
+local MESH_FOR_SIDES = {}
+for n = MIN_SIDES, MAX_SIDES do
+  local best, bd = COMMON_DICE[1], math.huge
+  for _, v in ipairs(COMMON_DICE) do
+    local d = math.abs(v - n); if d < bd then bd, best = d, v end
+  end
+  MESH_FOR_SIDES[n] = MESH_BY_COMMON[best]
+end
+local function meshForSides(n) return MESH_FOR_SIDES[n] or MESH_D20 end
+
+-- Bounding box of the last projection, in whole pixels
+local boxX0, boxY0, boxX1, boxY1 = 0, 0, 0, 0
+
+-- Rotate + perspective-project the mesh into m.px/m.py; returns the rotation
+local function projectMesh(m, t, S, cx, cy)
+  local ca, sa = cos(t), sin(t)
+  local tb = t * TILT_RATE + TILT_PHASE
+  local cb, sb = cos(tb), sin(tb)
+  local vx, vy, vz, px, py = m.vx, m.vy, m.vz, m.px, m.py
+  local x0, y0, x1, y1 = 9999, 9999, -9999, -9999
+  for i = 1, m.nv do
+    local x, y, z = vx[i] * S, vy[i] * S, vz[i] * S
+    local yz = x * sa + y * ca
+    local denom = yz * sb + z * cb + ZOFF
+    if denom < NEAR then denom = NEAR end
+    local d = PROJ_SCALE / denom
+    local sx = floor(cx + (x * ca - y * sa) * d + 0.5)
+    local sy = floor(cy + (yz * cb - z * sb) * d + 0.5)
+    px[i], py[i] = sx, sy
+    if sx < x0 then x0 = sx end
+    if sx > x1 then x1 = sx end
+    if sy < y0 then y0 = sy end
+    if sy > y1 then y1 = sy end
+  end
+  boxX0, boxY0, boxX1, boxY1 = x0, y0, x1, y1
+  return ca, sa, cb, sb
 end
 
--- Remembers front/back state per face to add hysteresis near nz ≈ 0
-local faceVisCache = {}
-local ENTER_T, EXIT_T = -0.002, 0.002
+local drawLine, fillPolygon = gfx.drawLine, gfx.fillPolygon
+local setDitherPattern = gfx.setDitherPattern
+local DITHER_BAYER8 = gfx.image.kDitherTypeBayer8x8
+local ENTER_T, EXIT_T = -0.002, 0.002   -- face visibility hysteresis near edge-on
+local polyBuf = {}                       -- reused fillPolygon coordinate buffer
 
--- Round to whole pixels, then drop repeated and collinear points
-local function area2(a, b, c) return (b[1]-a[1])*(c[2]-a[2]) - (b[2]-a[2])*(c[1]-a[1]) end
-
-local function roundAndPruneInt(pts)
-  local ipts = {}
-  for i = 1, #pts do
-    local a = pts[i]
-    local b = pts[(i % #pts) + 1]
-    local ax, ay = floor(a[1] + 0.5), floor(a[2] + 0.5)
-    if not (ax == floor(b[1] + 0.5) and ay == floor(b[2] + 0.5)) then ipts[#ipts + 1] = { ax, ay } end
+-- === Wireframe: every edge ===
+local function drawWire(m)
+  local px, py, ea, eb = m.px, m.py, m.ea, m.eb
+  gfx.setColor(gfx.kColorBlack)
+  for i = 1, m.ne do
+    local a, b = ea[i], eb[i]
+    drawLine(px[a], py[a], px[b], py[b])
   end
-  local changed = true
-  while changed and #ipts >= 3 do
-    changed = false
-    for i = 1, #ipts do
-      local A = ipts[(i - 2) % #ipts + 1]
-      local B = ipts[i]
-      local C = ipts[i % #ipts + 1]
-      if area2(A, B, C) == 0 then table.remove(ipts, i); changed = true; break end
-    end
-  end
-  return ipts
 end
 
--- === Shaded: dithered front faces + visible edges ===
-local function drawDieSolid(V, E, F, t, cx, cy, halfSizePx)
-  local ca, sa, cb, sb = rotationFor(t)
-  local cx0, cy0 = centerOr(cx, cy)
-  local P = projectVerts(V, halfSizePx or halfSize(), cx0, cy0, ca, sa, cb, sb)
-
-  local cache = faceCache[F]
-  local FN, shades = cache.FN, cache.shades
-  local front = faceVisCache[F]
-  if not front then front = {}; faceVisCache[F] = front end
-
-  local EDGE_KEY = #V + 1   -- packs a vertex pair (a < b) into one table key
-  local visibleEdges = {}
-
+-- === Shaded: dithered front faces + edges of visible faces ===
+local function drawSolid(m, ca, sa, cb, sb)
+  local px, py, faces, shades, front = m.px, m.py, m.faces, m.shades, m.front
+  local fnx, fny, fnz = m.fnx, m.fny, m.fnz
   gfx.setImageDrawMode(gfx.kDrawModeCopy)
   gfx.setColor(gfx.kColorBlack)
 
   -- The dice are convex, so front faces never overlap and need no depth sort
-  for fi = 1, #F do
-    local n = FN[fi]
-    local _, _, nz = rotCam(n[1], n[2], n[3], ca, sa, cb, sb)
+  for fi = 1, m.nf do
+    -- Camera-space z of the rotated face normal (negative = facing the viewer)
+    local nz = (fnx[fi] * sa + fny[fi] * ca) * sb + fnz[fi] * cb
     local isFront
-    if front[fi] then isFront = (nz < EXIT_T) else isFront = (nz < ENTER_T) end
+    if front[fi] then isFront = nz < EXIT_T else isFront = nz < ENTER_T end
     front[fi] = isFront
 
     if isFront then
-      local idxs = F[fi]
-      local pts = {}
-      for i = 1, #idxs do
-        local a, b = idxs[i], idxs[(i % #idxs) + 1]
-        pts[i] = P[a]
-        if a > b then a, b = b, a end
-        visibleEdges[a * EDGE_KEY + b] = true
-      end
-
-      -- Face vertices are already in winding order, so no re-sort is needed
-      local ipts = roundAndPruneInt(pts)
-      if #ipts >= 3 then
-        local coords = {}
-        for i = 1, #ipts do
-          coords[2 * i - 1] = ipts[i][1]
-          coords[2 * i]     = ipts[i][2]
+      local f = faces[fi]
+      local cnt = #f
+      local n = 0
+      local lx, ly = px[f[cnt]], py[f[cnt]]
+      for k = 1, cnt do
+        local x, y = px[f[k]], py[f[k]]
+        if x ~= lx or y ~= ly then
+          polyBuf[n + 1], polyBuf[n + 2] = x, y
+          n = n + 2
+          lx, ly = x, y
         end
-        gfx.setDitherPattern(shades[fi], gfx.image.kDitherTypeBayer8x8)
-        gfx.fillPolygon(unpack(coords))
+      end
+      if n >= 6 then
+        -- Skip faces that rounded down to zero area (edge-on)
+        local area = 0
+        local ax, ay = polyBuf[n - 1], polyBuf[n]
+        for k = 1, n, 2 do
+          local bx, by = polyBuf[k], polyBuf[k + 1]
+          area = area + (ax * by - bx * ay)
+          ax, ay = bx, by
+        end
+        if area ~= 0 then
+          setDitherPattern(shades[fi], DITHER_BAYER8)
+          fillPolygon(unpack(polyBuf, 1, n))
+        end
       end
     end
   end
 
-  gfx.setDitherPattern(1.0)
-
   -- Outline only edges that border a visible face; hidden back edges stay hidden
+  setDitherPattern(1.0)
   gfx.setColor(gfx.kColorBlack)
-  for i = 1, #E do
-    local ia, ib = E[i][1], E[i][2]
-    local lo, hi = ia, ib
-    if lo > hi then lo, hi = hi, lo end
-    if visibleEdges[lo * EDGE_KEY + hi] then drawProjectedEdge(P, ia, ib) end
+  local ea, eb, ef1, ef2 = m.ea, m.eb, m.ef1, m.ef2
+  for i = 1, m.ne do
+    if front[ef1[i]] or front[ef2[i]] then
+      local a, b = ea[i], eb[i]
+      drawLine(px[a], py[a], px[b], py[b])
+    end
   end
 end
 
--- === Wireframe: every edge ===
-local function drawDieWireframe(V, E, t, cx, cy, halfSizePx)
-  local cx0, cy0 = centerOr(cx, cy)
-  local P = projectVerts(V, halfSizePx or halfSize(), cx0, cy0, rotationFor(t))
-  gfx.setColor(gfx.kColorBlack)
-  for i = 1, #E do drawProjectedEdge(P, E[i][1], E[i][2]) end
-end
+-- ===== Dirty-rectangle repaint =====
+-- Each frame only the area covered by the die (this frame and last) is restored
+-- from a cached background image and redrawn, instead of the whole screen.
+local prevX0, prevY0, prevX1, prevY1 = nil, nil, nil, nil
 
--- Renders based on the user's "Shading" setting
-local function drawDieCurrent(V, E, F, t, cx, cy, halfSizePx)
-  if shadingEnabled then
-    drawDieSolid(V, E, F, t, cx, cy, halfSizePx)
-  else
-    drawDieWireframe(V, E, t, cx, cy, halfSizePx)
+-- Call after a full-screen redraw: there is no old die left to erase
+local function forgetDieBounds() prevX0 = nil end
+
+local function repaintDie(bg, clipX, clipY, clipW, clipH, m, t, S, cx, cy)
+  local ca, sa, cb, sb = projectMesh(m, t, S, cx, cy)
+  local x0, y0, x1, y1 = boxX0 - 1, boxY0 - 1, boxX1 + 1, boxY1 + 1
+  if prevX0 then
+    if prevX0 < x0 then x0 = prevX0 end
+    if prevY0 < y0 then y0 = prevY0 end
+    if prevX1 > x1 then x1 = prevX1 end
+    if prevY1 > y1 then y1 = prevY1 end
   end
+  prevX0, prevY0, prevX1, prevY1 = boxX0 - 1, boxY0 - 1, boxX1 + 1, boxY1 + 1
+
+  -- Limit to the drawing area
+  if x0 < clipX then x0 = clipX end
+  if y0 < clipY then y0 = clipY end
+  if x1 > clipX + clipW - 1 then x1 = clipX + clipW - 1 end
+  if y1 > clipY + clipH - 1 then y1 = clipY + clipH - 1 end
+  if x1 < x0 or y1 < y0 then return end
+
+  gfx.setClipRect(x0, y0, x1 - x0 + 1, y1 - y0 + 1)
+  bg:draw(0, 0)
+  if shadingEnabled then drawSolid(m, ca, sa, cb, sb) else drawWire(m) end
+  gfx.clearClipRect()
 end
 
 -- ============= Pretty UI helpers =============
@@ -732,40 +747,56 @@ local function drawHUD(text)
   gfx.setImageDrawMode(gfx.kDrawModeCopy)
 end
 
+-- =================== Cached backgrounds ===================
+-- Static parts of each screen are drawn once into images. Animation frames
+-- restore only the die's area from these instead of redrawing everything.
+local gameBg = gfx.image.new(SCREEN_W, SCREEN_H, gfx.kColorWhite)
+gfx.pushContext(gameBg)
+drawStageFrame()
+gfx.popContext()
+
+local titleBg = gfx.image.new(SCREEN_W, SCREEN_H, gfx.kColorWhite)
+gfx.pushContext(titleBg)
+gfx.setColor(gfx.kColorBlack)
+drawTextCentered("Digital Bard Dice", 14)
+gfx.popContext()
+
+local TITLE_CX = floor(SCREEN_W / 2)
+local TITLE_CY = floor(SCREEN_H * 0.56)
+local TITLE_HALF = floor(math.min(SCREEN_W, SCREEN_H) * TITLE_SCALE)
+
 -- === Title screen ===
+-- One animation frame: only the die's area is repainted
+local function titleFrame()
+  local m = MESH_BY_COMMON[COMMON_DICE[((title_idx - 1) % #COMMON_DICE) + 1]]
+  repaintDie(titleBg, 0, 0, SCREEN_W, SCREEN_H, m, title_ang, TITLE_HALF, TITLE_CX, TITLE_CY)
+end
+
+-- Full redraw
 local function drawTitle()
   gfx.clearClipRect()
-  gfx.clear(gfx.kColorWhite)
-  gfx.setImageDrawMode(gfx.kDrawModeCopy)
-  gfx.setColor(gfx.kColorBlack)
-
-  drawTextCentered("Digital Bard Dice", 14)
-
-  local n = COMMON_DICE[((title_idx - 1) % #COMMON_DICE) + 1]
-  local V, E, F = meshForSides(n)
-
-  local cx = math.floor(SCREEN_W / 2)
-  local cy = math.floor(SCREEN_H * 0.56)
-  local halfSizePx = math.floor(math.min(SCREEN_W, SCREEN_H) * TITLE_SCALE)
-
-  drawDieCurrent(V, E, F, title_ang, cx, cy, halfSizePx)
+  titleBg:draw(0, 0)
+  forgetDieBounds()
+  titleFrame()
 end
 
 -- =================== In-game rendering ===================
-local function redrawIdle()
-  currentScale = SCALE_IDLE
-  gfx.clear(gfx.kColorWhite)
-  drawStageFrame()
+-- One animation frame of the die inside the stage
+local function stageFrame(t, halfSizePx)
+  repaintDie(gameBg, STAGE_X, STAGE_Y, STAGE_W, STAGE_H, meshForSides(sides), t, halfSizePx, STAGE_CX, STAGE_CY)
+end
 
-  local sx, sy, sw, sh = stageRect()
-  gfx.setClipRect(sx, sy, sw, sh)
-
-  local V, E, F = meshForSides(sides)
-  gfx.setColor(gfx.kColorBlack)
-  drawDieCurrent(V, E, F, idleAngle)
-
+-- Full redraw of the game screen with an empty stage and the given HUD text
+local function drawGameScreen(hudText)
   gfx.clearClipRect()
-  drawHUD("")
+  gameBg:draw(0, 0)
+  forgetDieBounds()
+  drawHUD(hudText)
+end
+
+local function redrawIdle()
+  drawGameScreen("")
+  stageFrame(idleAngle, HALF_IDLE)
 end
 
 -- =================== Easing ===================
@@ -783,20 +814,15 @@ local function resultHudText()
 end
 
 redrawResult = function()
-  gfx.clear(gfx.kColorWhite)
-  drawStageFrame()
+  drawGameScreen(resultHudText())
 
-  local sx, sy, sw, sh = stageRect()
-  gfx.setClipRect(sx, sy, sw, sh)
-
+  gfx.setClipRect(STAGE_X, STAGE_Y, STAGE_W, STAGE_H)
   gfx.setColor(gfx.kColorBlack)
   if last_result then drawNumberBig(last_result) end
   if last_detail then
     drawAdvDisBoxes(last_detail.a, last_detail.b, last_detail.chosen, last_detail_mode)
   end
-
   gfx.clearClipRect()
-  drawHUD(resultHudText())
 end
 
 -- Switch to the idle preview without a large first-frame time step
@@ -809,12 +835,12 @@ end
 -- =================== Rolling ===================
 local function startSpin()
   state = S_SPIN
-  currentScale = SCALE_SPIN
+  drawGameScreen("Rolling…")
   spin_t0 = playdate.getCurrentTimeMilliseconds() / 1000
   local dur = randf(SPIN_TIME_MIN, SPIN_TIME_MAX)
   spin_t1 = spin_t0 + dur
 
-  ang0 = wrapTau(idleAngle)                 -- keep this wrapped
+  ang0 = wrapAngle(idleAngle)                 -- keep this wrapped
   local turns = randint(TURNS_MIN, TURNS_MAX)
   ang1 = ang0 + turns * TAU + randf(0.15, 0.85) * TAU
 end
@@ -834,7 +860,7 @@ local function finishSpin()
   last_result = chosen
   last_detail_mode = rollmode
   -- Carry the final spin pose into idle so the die doesn't jump
-  idleAngle = wrapTau(ang1)
+  idleAngle = wrapAngle(ang1)
 
   redrawResult()
 end
@@ -873,13 +899,13 @@ local function setupSystemMenu()
 end
 
 -- =================== Main loop ===================
-function playdate.update()
+local function step()
   if state == S_TITLE then
     local now = pd.getCurrentTimeMilliseconds() / 1000
     local dt  = now - last_ts
     last_ts   = now
 
-    title_ang      = wrapTau(title_ang + TITLE_ROT_SPEED * dt)
+    title_ang      = wrapAngle(title_ang + TITLE_ROT_SPEED * dt)
     title_time_acc = title_time_acc + dt
     if title_time_acc >= TITLE_SWITCH_SECS then
       title_time_acc = title_time_acc - TITLE_SWITCH_SECS
@@ -887,11 +913,11 @@ function playdate.update()
       if title_idx > #COMMON_DICE then title_idx = 1 end
     end
 
-    drawTitle()
+    titleFrame()
 
     if pd.buttonJustPressed(pd.kButtonA) then
       -- Capture the exact view you saw on title so idle matches
-      idleAngle = wrapTau(title_ang)
+      idleAngle = wrapAngle(title_ang)
       state = S_IDLE
       redrawIdle()
       return
@@ -905,21 +931,22 @@ function playdate.update()
     return
 
   elseif state == S_IDLE then
-    -- input
-    -- Settings are persisted by the pause/lock/sleep/terminate hooks
-    if pd.buttonJustPressed(pd.kButtonLeft)  then sides = math.max(MIN_SIDES, sides - 1) end
-    if pd.buttonJustPressed(pd.kButtonRight) then sides = math.min(MAX_SIDES, sides + 1) end
-    if pd.buttonJustPressed(pd.kButtonUp)    then quickNext() end
-    if pd.buttonJustPressed(pd.kButtonDown)  then quickPrev() end
-    if pd.buttonJustPressed(pd.kButtonB)     then rollmode = (rollmode + 1) % 3 end
+    -- Input. Settings are persisted by the pause/lock/sleep/terminate hooks.
+    local hudChanged = false
+    if pd.buttonJustPressed(pd.kButtonLeft)  then sides = math.max(MIN_SIDES, sides - 1); hudChanged = true end
+    if pd.buttonJustPressed(pd.kButtonRight) then sides = math.min(MAX_SIDES, sides + 1); hudChanged = true end
+    if pd.buttonJustPressed(pd.kButtonUp)    then quickNext(); hudChanged = true end
+    if pd.buttonJustPressed(pd.kButtonDown)  then quickPrev(); hudChanged = true end
+    if pd.buttonJustPressed(pd.kButtonB)     then rollmode = (rollmode + 1) % 3; hudChanged = true end
     if pd.buttonJustPressed(pd.kButtonA)     then startSpin(); return end
 
-    -- animate + draw every frame
+    -- Animate: the HUD only redraws when it changes; the die every frame
     local now = pd.getCurrentTimeMilliseconds() / 1000
     local dt  = now - last_ts
     last_ts   = now
-    idleAngle = wrapTau(idleAngle + IDLE_ROT_SPEED * dt)
-    redrawIdle()
+    idleAngle = wrapAngle(idleAngle + IDLE_ROT_SPEED * dt)
+    if hudChanged then drawHUD("") end
+    stageFrame(idleAngle, HALF_IDLE)
     return
 
   elseif state == S_SPIN then
@@ -927,22 +954,8 @@ function playdate.update()
     local u = (now - spin_t0) / (spin_t1 - spin_t0)
     if u < 0 then u = 0 elseif u > 1 then u = 1 end
     local e = easeRollNatural(u)
-    local ang = wrapTau(ang0 + (ang1 - ang0) * e)
-
-    gfx.setColor(gfx.kColorWhite)
-    gfx.fillRect(CLIP_X - 3, CLIP_Y - 3, CLIP_W + 6, CLIP_H + 6)
-    drawStageFrame()
-
-    local sx, sy, sw, sh = stageRect()
-    gfx.setClipRect(sx, sy, sw, sh)
-
-    currentScale = SCALE_SPIN
-    local V, E, F = meshForSides(sides)
-    gfx.setColor(gfx.kColorBlack)
-    drawDieCurrent(V, E, F, ang)
-
-    gfx.clearClipRect()
-    drawHUD("Rolling…")
+    local ang = wrapAngle(ang0 + (ang1 - ang0) * e)
+    stageFrame(ang, HALF_SPIN)
 
     if now >= spin_t1 then finishSpin() end
     return
@@ -961,6 +974,10 @@ function playdate.update()
   end
 end
 
+function playdate.update()
+  step()
+  if SHOW_FPS then pd.drawFPS(0, 0) end
+end
 
 function playdate.gameWillPause()
   saveState()
@@ -976,8 +993,9 @@ local function redrawCurrent()
     drawTitle()
   elseif state == S_RESULT then
     redrawResult()
+  elseif state == S_SPIN then
+    drawGameScreen("Rolling…")
   end
-  -- S_SPIN redraws every frame on its own
 end
 
 function playdate.gameWillResume()
@@ -1010,5 +1028,6 @@ end
 
 loadState()
 setupSystemMenu()
-pd.display.setRefreshRate(30)
+pd.display.setRefreshRate(TARGET_FPS)
 state = S_TITLE
+drawTitle()   -- first full frame; later frames repaint only the die

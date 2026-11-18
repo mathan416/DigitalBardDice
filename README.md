@@ -4,7 +4,7 @@ Digital Bard Dice is a Playdate dice roller for tabletop RPGs. It renders animat
 
 ## Features
 
-- Animated wireframe or shaded dice preview
+- Animated shaded dice preview (shaded by default, with a wireframe option)
 - Any die from D2 to D20 (non-standard sizes are previewed with the nearest standard die shape)
 - Quick switching between common dice: D4, D6, D8, D10, D12, D20
 - Normal, advantage, and disadvantage roll modes
